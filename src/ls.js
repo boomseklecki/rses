@@ -31,13 +31,14 @@ function extractFirstTask(path, tool) {
         }
       }
     } else {
+      // Claude: user/assistant text is nested under `message.content`.
       for (const line of lines) {
         let obj
         try { obj = JSON.parse(line) } catch { continue }
-        if (obj.type === 'user') {
-          const c = obj.content
+        if (obj.type === 'user' && !obj.isSidechain) {
+          const c = obj.message?.content
           const text = typeof c === 'string' ? c : (Array.isArray(c) ? c.find(x => x.type === 'text')?.text || '' : '')
-          if (text) return text.slice(0, 70)
+          if (text && !/^<(command-|local-command-)/.test(text)) return text.slice(0, 70)
         }
       }
     }
@@ -49,7 +50,18 @@ function extractCwd(path, tool) {
   try {
     const raw = readFileSync(path, 'utf8')
     const lines = raw.split('\n').filter(l => l.trim())
-    if (tool !== 'codex') return null
+
+    // Claude: cwd is stored on message records, but a session can open with
+    // dozens of metadata records (ai-title, file-history-snapshot, …) first,
+    // so scan until we find one rather than capping at the first few lines.
+    if (tool !== 'codex') {
+      for (const line of lines) {
+        let obj
+        try { obj = JSON.parse(line) } catch { continue }
+        if (obj.cwd) return obj.cwd
+      }
+      return null
+    }
 
     for (const line of lines.slice(0, 10)) {
       let obj

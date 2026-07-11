@@ -18,8 +18,8 @@ import {
   parseOpenCodeSession, findOpenCodeSessionById, getLastOpenCodeSession,
   queryOpenCodeSessions
 } from '../src/parse-opencode.js'
-import { buildHandoff } from '../src/build-handoff.js'
-import { launchWithHandoff } from '../src/launch.js'
+import { buildHandoff, buildChainHandoff } from '../src/build-handoff.js'
+import { launchWithHandoff, launchViaAoe } from '../src/launch.js'
 import { lsSessions } from '../src/ls.js'
 import { pick } from '../src/picker.js'
 
@@ -46,6 +46,7 @@ program
   .command('export <source> <id>')
   .description('Print handoff text from a session without launching anything')
   .option('--turns <n>', 'Number of recent turns to include', '6')
+  .option('--chain <ids>', 'Comma-separated ancestor session ids (oldest→newest) to prepend as chain context (claude only)')
   .action((rawSource, id, opts) => {
     const source = resolve_alias(rawSource)
     if (!VALID_TOOLS.has(source)) {
@@ -81,18 +82,23 @@ if (withIdx === 1 && !['ls', 'export', '--help', '-h', '--version', '-V'].includ
   const source = args[withIdx + 1]
   const rest = args.slice(withIdx + 2)
 
-  const opts = { last: false, dryRun: false, dir: null, turns: '6', passthrough: [] }
+  const opts = { last: false, dryRun: false, dir: null, turns: '6', chain: null, viaAoe: false, title: null, cwd: null, structured: false, passthrough: [] }
   let id = null
 
   // Known rses flags — everything else is forwarded to the target tool
-  const RSES_FLAGS = new Set(['--last', '--dry-run', '--dir', '--turns'])
+  const RSES_FLAGS = new Set(['--last', '--dry-run', '--dir', '--turns', '--chain', '--title', '--cwd'])
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]
     if (arg === '--last') opts.last = true
     else if (arg === '--dry-run') opts.dryRun = true
+    else if (arg === '--via-aoe') opts.viaAoe = true
     else if (arg === '--dir') { opts.dir = rest[++i] }
     else if (arg === '--turns') { opts.turns = rest[++i] }
+    else if (arg === '--chain') { opts.chain = rest[++i] }
+    else if (arg === '--title') { opts.title = rest[++i] }
+    else if (arg === '--cwd') { opts.cwd = rest[++i] }
+    else if (arg === '--structured') opts.structured = true
     else if (!arg.startsWith('-')) id = arg
     else {
       // Unknown flag — pass through to the target tool
@@ -186,20 +192,25 @@ async function pickSession(source, filterDir) {
     if (!files.length) return null
 
     const { readFileSync } = await import('fs')
-    const items = files.slice(0, 30).map(({ path, mtime }) => {
+    const items = files.slice(0, 30).map(({ path, mtime, cwd }) => {
       const date = new Date(mtime).toISOString().slice(0, 16).replace('T', ' ')
       let task = '(no task)'
+      let sessionCwd = cwd
       try {
-        const line = readFileSync(path, 'utf8').split('\n').find(l => {
-          try { return JSON.parse(l).type === 'user' } catch { return false }
-        })
-        if (line) {
-          const o = JSON.parse(line)
-          const c = o.content
-          task = (typeof c === 'string' ? c : (Array.isArray(c) ? c.find(x => x.type === 'text')?.text || '' : ''))
+        const rawLines = readFileSync(path, 'utf8').split('\n')
+        for (const l of rawLines) {
+          let o
+          try { o = JSON.parse(l) } catch { continue }
+          if (!sessionCwd && o.cwd) sessionCwd = o.cwd
+          // Claude nests turn text under `message.content`.
+          if (o.type === 'user' && !o.isSidechain) {
+            const c = o.message?.content
+            const text = (typeof c === 'string' ? c : (Array.isArray(c) ? c.find(x => x.type === 'text')?.text || '' : ''))
+            if (text && !/^<(command-|local-command-)/.test(text)) { task = text; break }
+          }
         }
       } catch {}
-      return { display: makeDisplay(date, '—', task), value: path }
+      return { display: makeDisplay(date, shorten(sessionCwd), task), value: path }
     })
 
     return pick(items, 'Select a Claude session:')
@@ -291,7 +302,32 @@ async function resolveAndBuildAsync(source, id, opts) {
   }
 
   parsed.turns = parsed.turns.slice(-turns * 2)
+  if (opts.chain) return buildChainHandoff(source, parsed, resolveClaudeChain(source, opts.chain))
   return buildHandoff(source, parsed)
+}
+
+// Resolve a curated, comma-separated list of ancestor session ids (oldest→newest)
+// into parsed sessions for buildChainHandoff. Explicit by design: aoe TUI forks and
+// compaction-continuations are indistinguishable in the JSONL, so the user curates.
+function resolveClaudeChain(source, chainStr) {
+  if (source !== 'claude') {
+    console.error('--chain is only supported for claude sources right now.')
+    process.exit(1)
+  }
+  const ids = chainStr.split(',').map(s => s.trim()).filter(Boolean)
+  const ancestors = []
+  for (const cid of ids) {
+    const fp = findClaudeSessionById(cid)
+    if (!fp) {
+      console.error(`Chain session not found: ${cid}`)
+      console.error('Tip: run `rses ls claude` to list sessions.')
+      process.exit(1)
+    }
+    const parsed = parseClaudeSession(fp)
+    parsed.filePath = fp
+    ancestors.push(parsed)
+  }
+  return ancestors
 }
 
 function resolveAndBuild(source, id, opts) {
@@ -321,6 +357,7 @@ function resolveAndBuild(source, id, opts) {
   }
 
   parsed.turns = parsed.turns.slice(-turns * 2)
+  if (opts.chain) return buildChainHandoff(source, parsed, resolveClaudeChain(source, opts.chain))
   return buildHandoff(source, parsed)
 }
 
@@ -356,7 +393,17 @@ async function runHandoff(target, source, id, opts) {
   if (cwdLine) console.log(`  ${cwdLine}`)
   if (taskLines[0]) console.log(`  Task: "${taskLines[0].trim().slice(0, 80)}"`)
   console.log()
-  console.log(`  Launching ${target}...\n`)
-
-  launchWithHandoff(target, handoff, null, opts.passthrough || [])
+  if (opts.viaAoe) {
+    // Run the aoe session in the *source* project's dir (from the handoff's
+    // "Work in:" line), not wherever rses happened to be invoked.
+    const sessionCwd = (opts.cwd ? expandPath(opts.cwd) : (handoff.match(/^Work in: (.+)$/m)?.[1] || process.cwd())).trim()
+    const title = opts.title || `rses: ${id || source}`
+    const mode = opts.structured ? 'structured' : 'terminal'
+    console.log(`  Handing off to ${target} via aoe (${mode} view, cwd: ${sessionCwd}, title: ${title})...\n`)
+    launchViaAoe(target, handoff, { dir: sessionCwd, title, structured: opts.structured })
+  } else {
+    const pass = opts.title ? [...(opts.passthrough || []), '--title', opts.title] : (opts.passthrough || [])
+    console.log(`  Launching ${target}...\n`)
+    launchWithHandoff(target, handoff, null, pass)
+  }
 }

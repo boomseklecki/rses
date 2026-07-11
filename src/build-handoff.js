@@ -24,7 +24,7 @@ export function buildHandoff(source, parsed) {
 
   // ── Directive first — models process top-down ──────────────────────────
   const article = /^[aeiou]/i.test(toolName) ? 'an' : 'a'
-  lines.push(`Continue this work. You are picking up from ${article} ${toolName} session.`)
+  lines.push(`You're inheriting context from ${article} ${toolName} session (summarized below). Read it to get oriented, then STOP and wait for my direction. Do not open the transcript, read project files, or take any action until I explicitly ask.`)
   if (cwd) lines.push(`Work in: ${cwd}`)
   if (branch) lines.push(`Branch: ${branch}`)
   lines.push('')
@@ -64,9 +64,46 @@ export function buildHandoff(source, parsed) {
   // ── Session file pointer for deep context ──────────────────────────────
   if (filePath) {
     lines.push('')
-    lines.push(`Full session transcript: ${filePath}`)
-    lines.push(`Read this file if you need the complete conversation history.`)
+    lines.push(`Full ${toolName} transcript (open only if I ask you to dig deeper): ${filePath}`)
   }
 
+  return lines.join('\n')
+}
+
+const SUMMARY_MAX = 1500 // ancestor end-state summaries get more room than a normal turn
+
+// Combine a primary/tail session with a user-curated list of ancestor sessions
+// (oldest→newest). The tail gets the full single-session handoff; each ancestor
+// contributes a compact block (task + end-state summary + last exchange + a
+// transcript pointer) so the thread's arc survives without inlining whole files.
+export function buildChainHandoff(source, primary, ancestors) {
+  const base = buildHandoff(source, primary)
+  if (!ancestors || !ancestors.length) return base
+
+  const TOOL_NAMES = { codex: 'Codex', claude: 'Claude', opencode: 'OpenCode' }
+  const toolName = TOOL_NAMES[source] || source
+
+  const span = (a) => [a.firstTs, a.lastTs]
+    .filter(Boolean)
+    .map(t => String(t).slice(0, 16).replace('T', ' '))
+    .join(' – ')
+
+  const lines = [base, '', '## Prior sessions in this thread (chain context — open these transcripts only if I ask)']
+  for (const a of ancestors) {
+    const id = a.uuid || a.sessionId || 'unknown'
+    const range = span(a)
+    lines.push('')
+    lines.push(`### ${id}${range ? `  (${range})` : ''}`)
+    if (a.task) lines.push(`Original task: ${trunc(a.task, TASK_MAX)}`)
+    if (a.finalSummary) lines.push(`End-state summary: ${trunc(a.finalSummary, SUMMARY_MAX)}`)
+    const lastUser = [...a.turns].reverse().find(t => t.role === 'user')
+    const lastAsst = [...a.turns].reverse().find(t => t.role === 'assistant')
+    if (lastUser || lastAsst) {
+      lines.push('Last exchange:')
+      if (lastUser) lines.push(`  User: ${trunc(lastUser.text, TURN_MAX)}`)
+      if (lastAsst) lines.push(`  ${toolName}: ${trunc(lastAsst.text, TURN_MAX)}`)
+    }
+    if (a.filePath) lines.push(`Transcript: ${a.filePath}`)
+  }
   return lines.join('\n')
 }
